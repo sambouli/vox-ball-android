@@ -75,6 +75,7 @@ class GameView @JvmOverloads constructor(
     private val quitR = RectF()
     private val grantR = RectF()
     private val skipR = RectF()
+    private val micRetryR = RectF()
 
     private lateinit var dash: DashPathEffect
     private var t = 0f
@@ -132,8 +133,35 @@ class GameView @JvmOverloads constructor(
     }
 
     fun pauseGame() {
+        pauseRequested = false
         stopLoop()
         analyzer.stop()
+    }
+
+    /** Pause requested by the game loop, on the render thread, never from the UI thread. */
+    @Volatile
+    private var pauseRequested = false
+
+    fun autoPauseIfRunning() {
+        if (engine.isRunning() || engine.phase == Phase.ROUND_START || engine.phase == Phase.CALIB_DONE) {
+            pauseRequested = true
+        }
+    }
+
+    /**
+     * Leaving the pause overlay. If the microphone stalled in the meantime (the analyser
+     * thread died, or it was never restarted), restart it; if the voice is still missing
+     * after a moment, send the point back to the centre instead of letting it be lost.
+     */
+    private fun onResumeClicked() {
+        engine.togglePause()
+        startVoice()
+        postDelayed({
+            if (engine.isRunning() && !analyzer.running) {
+                startVoice()
+                if (!analyzer.running) engine.restartCurrentPoint()
+            }
+        }, 600)
     }
 
     fun resumeGame() {
@@ -178,6 +206,10 @@ class GameView @JvmOverloads constructor(
             t += dt
 
             val voice = analyzer.frame
+            if (pauseRequested && engine.isRunning()) {
+                pauseRequested = false
+                engine.togglePause()
+            }
             engine.update(dt, voice)
 
             val c = try {
@@ -224,12 +256,24 @@ class GameView @JvmOverloads constructor(
         val y = e.y
         when (engine.phase) {
             Phase.HINTS -> engine.advanceHint()
-            Phase.CALIBRATION -> if (skipR.contains(x, y)) engine.skipCalibSeat()
+            Phase.CALIB_READY, Phase.CALIB_COUNTDOWN -> when {
+                skipR.contains(x, y) -> engine.skipCalibSeat()
+                else -> engine.beginCalibCountdown()
+            }
+            Phase.CALIB_RECORD -> {
+                if (skipR.contains(x, y) || engine.calibAwaitingConfirm) engine.confirmCalibResult()
+            }
+            Phase.CALIB_DONE -> engine.continueAfterCalibPause()
+            Phase.ROUND_START -> engine.startRound()
             Phase.PAUSED -> when {
-                resumeR.contains(x, y) -> engine.togglePause()
+                resumeR.contains(x, y) -> onResumeClicked()
                 quitR.contains(x, y) -> onExit?.invoke()
             }
-            else -> if (pauseR.contains(x, y)) engine.togglePause()
+            else -> when {
+                micRetryR.contains(x, y) -> startVoice()
+                pauseR.contains(x, y) -> engine.togglePause()
+                else -> Unit
+            }
         }
         performClick()
         return true
@@ -266,13 +310,21 @@ class GameView @JvmOverloads constructor(
                 drawHints(c)
                 drawMicMeter(c, voice, height * 0.92f)
             }
-            Phase.CALIBRATION -> {
+            Phase.CALIB_READY, Phase.CALIB_COUNTDOWN, Phase.CALIB_RECORD -> {
                 drawArena(c, showBall = false)
                 drawCalibration(c, voice)
             }
             Phase.PAUSED -> {
                 drawArena(c, showBall = true)
                 drawPause(c)
+            }
+            Phase.CALIB_DONE -> {
+                drawArena(c, showBall = false)
+                drawCalibDone(c)
+            }
+            Phase.ROUND_START -> {
+                drawArena(c, showBall = false)
+                drawRoundStart(c)
             }
             else -> {
                 drawArena(c, showBall = true)
@@ -349,6 +401,18 @@ class GameView @JvmOverloads constructor(
         }
 
         drawMicMeter(c, analyzer.frame, h * 0.985f)
+
+        // microphone health: a stalled capture looks exactly like two silent players, so
+        // say it out loud instead of leaving the game unplayable with no explanation.
+        if (!analyzer.running) {
+            text(
+                c, "⚠ MICRO À L'ARRÊT — touchez ici pour le relancer",
+                w / 2f, h * 0.93f, h * 0.030f, Palette.RED, bold = true
+            )
+            micRetryR.set(w * 0.2f, h * 0.90f, w * 0.8f, h * 0.95f)
+        } else {
+            micRetryR.setEmpty()
+        }
 
         // pause button
         text(c, "II", pauseR.centerX(), pauseR.centerY() + h * 0.022f, h * 0.042f, Palette.DIM, bold = true)
@@ -464,40 +528,66 @@ class GameView @JvmOverloads constructor(
         scrim.color = 0xCC000000.toInt()
         c.drawRect(0f, 0f, w, h, scrim)
 
-        text(c, Content.calibTitle(e.calibSeat), w / 2f, h * 0.24f, h * 0.055f, Palette.TEXT, bold = true)
-        text(c, Content.CALIB_BODY, w / 2f, h * 0.33f, h * 0.036f, Palette.DIM)
+        text(c, Content.calibTitle(e.calibSeat), w / 2f, h * 0.20f, h * 0.052f, Palette.TEXT, bold = true)
 
-        // progress
-        val barW = w * 0.52f
-        val barX = w / 2f - barW / 2f
-        val barY = h * 0.46f
-        val barH = h * 0.045f
-        val bg = RectF(barX, barY, barX + barW, barY + barH)
-        fill.color = 0x22FFFFFF
-        c.drawRoundRect(bg, barH / 2f, barH / 2f, fill)
-        val p = e.calibProgress
-        if (p > 0f) {
-            fill.color = Palette.RED
-            c.drawRoundRect(
-                RectF(barX, barY, barX + barW * p, barY + barH),
-                barH / 2f, barH / 2f, fill
-            )
+        when (e.phase) {
+            Phase.CALIB_READY -> {
+                text(c, "le téléphone est à vous, seul.", w / 2f, h * 0.30f, h * 0.034f, Palette.DIM)
+                text(
+                    c, "Fredonnez « mmmm » à votre hauteur naturelle pendant 2 secondes.",
+                    w / 2f, h * 0.40f, h * 0.038f, Palette.TEXT
+                )
+                text(c, "TOUCHEZ POUR COMMENCER", w / 2f, h * 0.55f, h * 0.044f, Palette.RED, bold = true)
+                text(c, "un décompte 3-2-1 vous laisse le temps de respirer", w / 2f, h * 0.63f, h * 0.026f, Palette.DIM)
+            }
+            Phase.CALIB_COUNTDOWN -> {
+                val n = kotlin.math.ceil(e.calibCountdownLeft).toInt().coerceAtLeast(1)
+                val frac = e.calibCountdownLeft - kotlin.math.floor(e.calibCountdownLeft)
+                val size = h * (0.20f + 0.06f * frac)
+                text(c, n.toString(), w / 2f, h * 0.52f, size, Palette.RED, bold = true)
+                text(c, "respirez…", w / 2f, h * 0.66f, h * 0.034f, Palette.DIM)
+            }
+            Phase.CALIB_RECORD -> {
+                if (e.calibAwaitingConfirm) {
+                    text(
+                        c,
+                        if (e.calibOk) "VOIX ENREGISTRÉE" else "RIEN ENTENDU",
+                        w / 2f, h * 0.40f, h * 0.055f,
+                        if (e.calibOk) Palette.RED else Palette.ACCENT, bold = true
+                    )
+                    text(
+                        c,
+                        if (e.calibOk) "merci — on passe à la suite" else "fredonnez plus fort, on recommence",
+                        w / 2f, h * 0.50f, h * 0.034f, Palette.TEXT
+                    )
+                    text(c, "TOUCHEZ POUR CONTINUER", w / 2f, h * 0.62f, h * 0.028f, Palette.DIM, bold = true)
+                } else {
+                    // recording: progress ring of the 2.5 s window
+                    val r = h * 0.13f
+                    stroke.color = 0x33FFFFFF
+                    stroke.strokeWidth = h * 0.014f
+                    stroke.pathEffect = null
+                    c.drawCircle(w / 2f, h * 0.42f, r, stroke)
+                    val done = 1f - (e.calibRecordLeft / Tuning.CALIB_RECORD).coerceIn(0f, 1f)
+                    stroke.color = if (voice.voiced) Palette.RED else Palette.GREY
+                    val oval = RectF(w / 2f - r, h * 0.42f - r, w / 2f + r, h * 0.42f + r)
+                    c.drawArc(oval, -90f, 360f * done, false, stroke)
+                    if (voice.voiced) {
+                        fill.color = 0x33E5484D
+                        c.drawCircle(w / 2f, h * 0.42f, r * 0.8f, fill)
+                    }
+                    text(c, "CHANTez", w / 2f, h * 0.44f, h * 0.040f, Palette.TEXT, bold = true)
+                    val f0 = if (voice.voiced) String.format("%.0f Hz", voice.f0) else "—"
+                    text(c, f0, w / 2f, h * 0.63f, h * 0.036f, Palette.ACCENT, bold = true)
+                }
+            }
+            else -> Unit
         }
-
-        // live readouts
-        val f0 = if (voice.voiced) String.format("%.0f Hz", voice.f0) else "—"
-        text(c, "hauteur détectée : $f0", w / 2f, h * 0.60f, h * 0.032f, Palette.ACCENT)
-        val dbText = if (voice.voiced) "voix détectée" else Content.CALIB_WAIT
-        text(
-            c, dbText, w / 2f, h * 0.655f, h * 0.028f,
-            if (voice.voiced) Palette.RED else Palette.DIM
-        )
-        text(c, Content.CALIB_NEED, w / 2f, h * 0.725f, h * 0.024f, Palette.DIM)
 
         // mic level
         val mw = w * 0.30f
         val mx = w / 2f - mw / 2f
-        val my = h * 0.775f
+        val my = h * 0.74f
         val mh = h * 0.014f
         fill.color = 0x22FFFFFF
         c.drawRoundRect(RectF(mx, my, mx + mw, my + mh), mh / 2f, mh / 2f, fill)
@@ -507,11 +597,12 @@ class GameView @JvmOverloads constructor(
             c.drawRoundRect(RectF(mx, my, mx + mw * lvl, my + mh), mh / 2f, mh / 2f, fill)
         }
 
-        // skip
-        stroke.color = Palette.DIM
-        stroke.strokeWidth = dp(1.5f)
-        c.drawRoundRect(skipR, dp(6f), dp(6f), stroke)
-        text(c, Content.SKIP, skipR.centerX(), skipR.centerY() + h * 0.011f, h * 0.024f, Palette.DIM)
+        if (e.phase != Phase.CALIB_DONE) {
+            stroke.color = Palette.DIM
+            stroke.strokeWidth = dp(1.5f)
+            c.drawRoundRect(skipR, dp(6f), dp(6f), stroke)
+            text(c, Content.SKIP, skipR.centerX(), skipR.centerY() + h * 0.011f, h * 0.024f, Palette.DIM)
+        }
     }
 
     private fun drawPause(c: Canvas) {
@@ -531,6 +622,61 @@ class GameView @JvmOverloads constructor(
         stroke.strokeWidth = dp(2f)
         c.drawRoundRect(quitR, h * 0.02f, h * 0.02f, stroke)
         text(c, Content.QUIT, quitR.centerX(), quitR.centerY() + h * 0.016f, h * 0.040f, Palette.DIM)
+    }
+
+    private fun drawCalibDone(c: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val scrim = Paint()
+        scrim.color = 0xF0000000.toInt()
+        c.drawRect(0f, 0f, w, h, scrim)
+
+        val a = 0.6f + 0.4f * kotlin.math.sin(t * 5f)
+        tp.alpha = (a * 255).toInt()
+        text(c, "JOUEUR 1 : C'EST FAIT", w / 2f, h * 0.34f, h * 0.040f, Palette.DIM, bold = true)
+        tp.alpha = 255
+        text(c, "À JOUEUR 2", w / 2f, h * 0.46f, h * 0.075f, Palette.TEXT, bold = true)
+        text(
+            c, "passez le téléphone, puis fredonnez « mmmm »", w / 2f, h * 0.55f, h * 0.034f, Palette.DIM
+        )
+
+        val left = engine.phaseTimer
+        text(
+            c, "dans ${left.toInt() + 1}", w / 2f, h * 0.66f, h * 0.032f, Palette.RED, bold = true
+        )
+        text(c, Content.TAP, w / 2f, h * 0.86f, h * 0.028f, Palette.TEXT, bold = true)
+    }
+
+    private fun drawRoundStart(c: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val scrim = Paint()
+        scrim.color = 0xE6000000.toInt()
+        c.drawRect(0f, 0f, w, h, scrim)
+
+        text(c, "PRÊTS ?", w / 2f, h * 0.24f, h * 0.070f, Palette.TEXT, bold = true)
+
+        val rules = listOf(
+            "VOIX AIGUË → la raquette monte",
+            "VOIX GRAVE → la raquette descend",
+            "PARLEZ pour remplir la raquette en ROUGE",
+            "Silence = raquette grise, la balle passe"
+        )
+        var y = h * 0.38f
+        for (r in rules) {
+            text(c, r, w / 2f, y, h * 0.038f, Palette.TEXT)
+            y += h * 0.065f
+        }
+        text(
+            c, "J1 est la raquette de GAUCHE, J2 celle de DROITE",
+            w / 2f, y + h * 0.02f, h * 0.030f, Palette.RED, bold = true
+        )
+
+        val left = engine.phaseTimer
+        text(
+            c, "départ dans ${left.toInt() + 1}", w / 2f, h * 0.80f, h * 0.034f, Palette.ACCENT, bold = true
+        )
+        text(c, Content.TAP, w / 2f, h * 0.90f, h * 0.028f, Palette.DIM, bold = true)
     }
 
     private fun drawCrash(c: Canvas, report: String) {

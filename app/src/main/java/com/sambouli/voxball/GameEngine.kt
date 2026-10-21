@@ -22,7 +22,21 @@ import kotlin.random.Random
  * Pure Kotlin, no Android dependency, so the physics can be unit tested.
  */
 
-enum class Phase { HINTS, CALIBRATION, SERVE, PLAY, POINT, PAUSED }
+enum class Phase {
+    HINTS,
+    CALIB_READY,
+    CALIB_COUNTDOWN,
+    CALIB_RECORD,
+    CALIB_DONE,
+    ROUND_START,
+    SERVE,
+    PLAY,
+    POINT,
+    PAUSED
+}
+
+/** What the pause overlay must return to, since pausing is allowed in several phases. */
+enum class Stage { SERVE, PLAY, POINT, ROUND_START, CALIB_DONE }
 
 object Tuning {
     const val BALLS_PER_LEVEL = 5
@@ -30,9 +44,16 @@ object Tuning {
     const val CHARGE_DECAY = 1.9f
     const val CHARGE_TO_BOUNCE = 0.34f    // below this the racket is a ghost
     const val PADDLE_SPEED = 1.05f        // x world height per second
-    const val BASE_SPEED = 0.60f          // ball speed at level 1, x world height per second
-    const val SPEED_STEP = 0.12f
-    const val SPEED_CAP = 2.3f
+    const val BASE_SPEED = 0.34f          // ball speed at level 1, x world height per second
+    const val SPEED_STEP = 0.055f
+    const val SPEED_CAP = 1.5f
+    const val BOUNCE_GAIN = 1.02f         // a returned ball only drifts faster
+    const val CALIB_PAUSE = 1.6f          // after J1, "hand over" screen before J2 even starts
+    const val ROUND_PAUSE = 2.4f          // rules recap before the first ball
+    const val CALIB_COUNTDOWN = 3f
+    const val CALIB_RECORD = 2.5f
+    const val CALIB_RETRY_PAUSE = 2.2f
+    const val SERVE_DELAY = 1.2f
     const val PITCH_DEAD_SEMIS = 1.1f     // +-1.1 semitone around own pitch = no movement
     const val PITCH_FULL_SEMIS = 5.0f     // 5 semitones away = full speed
     const val DEFAULT_BASELINE = 175f
@@ -81,12 +102,29 @@ class GameEngine {
         private set
     var calibProgress = 0f
         private set
+
+    /** True once the current capture cycle has finished and we are showing its result. */
+    var calibAwaitingConfirm = false
+        private set
+
+    /** Result of the last capture cycle: enough voiced frames or not. */
+    var calibOk = false
+        private set
+    var calibCountdownLeft = 0f
+        private set
+    var calibRecordLeft = 0f
+        private set
     var serveTo = 0
     var activeSeat = 0
         private set
     var banner = ""
     var bannerTimer = 0f
     var pointTimer = 0f
+    var phaseTimer = 0f
+
+    /** Direction search bias: a ball the receiver lets through repeats the same side,
+     *  unless it comes from the side that was already served to, in which case it flips. */
+    private var lastPassDir = 0
 
     /** How loud the microphone hears the room (0..1), used by the calibration screen. */
     var micLevel = 0f
@@ -132,45 +170,128 @@ class GameEngine {
         hint++
         if (hint >= Content.hints.size) {
             hint = Content.hints.size - 1
-            phase = Phase.CALIBRATION
-            calibSeat = 0
-            activeSeat = 0
-            samples.clear()
-            calibSamples = 0
-            calibProgress = 0f
+            startCalibration()
         }
+    }
+
+    /** Sends the ball to the given side (0 = towards J1 on the left). */
+    fun serveToSide(dir: Int) {
+        serveTo = if (dir < 0) 0 else 1
+        activeSeat = serveTo
+        beginServe()
     }
 
     // ---------------------------------------------------------- calibration
 
-    fun skipCalibSeat() {
-        if (phase != Phase.CALIBRATION) return
-        samples.clear()
-        pads[calibSeat].baseline = Tuning.DEFAULT_BASELINE
-        nextCalibSeat()
+    private fun startCalibration() {
+        calibSeat = 0
+        activeSeat = 0
+        lastPassDir = 0
+        calibAwaitingConfirm = false
+        calibOk = false
+        calibCountdownLeft = Tuning.CALIB_COUNTDOWN
+        calibRecordLeft = 0f
+        // the player being measured owns the microphone, whoever is "active" for the ball
+        phase = Phase.CALIB_READY
+        resetSamples()
     }
 
-    private fun nextCalibSeat() {
-        samples.clear()
-        calibSamples = 0
-        calibProgress = 0f
+    /** The seated player is ready: start a fresh 3-2-1 countdown. */
+    fun beginCalibCountdown() {
+        if (phase != Phase.CALIB_READY && phase != Phase.CALIB_COUNTDOWN) return
+        resetSamples()
+        calibAwaitingConfirm = false
+        calibOk = false
+        calibCountdownLeft = Tuning.CALIB_COUNTDOWN
+        calibRecordLeft = 0f
+        phase = Phase.CALIB_COUNTDOWN
+    }
+
+    /** Called by the UI "skip" control: keeps the default baseline for this player. */
+    fun skipCalibSeat() {
+        val stage = phase
+        if (stage != Phase.CALIB_READY && stage != Phase.CALIB_COUNTDOWN &&
+            stage != Phase.CALIB_RECORD && stage != Phase.CALIB_DONE
+        ) return
+        resetSamples()
+        pads[calibSeat].baseline = Tuning.DEFAULT_BASELINE
+        calibAwaitingConfirm = false
+        calibOk = false
         if (calibSeat == 0) {
+            // skipping J1 is still a hand-over: J2 gets his own screen after the pause
             calibSeat = 1
             activeSeat = 1
+            phase = Phase.CALIB_DONE
+            phaseTimer = Tuning.CALIB_PAUSE
         } else {
-            startMatch()
+            finishCalibSeat()
         }
     }
 
-    private fun startMatch() {
+    private fun resetSamples() {
+        samples.clear()
+        calibSamples = 0
+        calibProgress = 0f
+    }
+
+    /**
+     * Called once the player has read the verdict of his take. A usable take hands over to
+     * the next player (with a deliberate pause); a silent one just retries this player.
+     */
+    fun confirmCalibResult() {
+        if (phase != Phase.CALIB_RECORD || !calibAwaitingConfirm) return
+        val ok = calibOk
+        calibAwaitingConfirm = false
+        calibOk = false
+        if (!ok) {
+            resetSamples()
+            calibCountdownLeft = Tuning.CALIB_COUNTDOWN
+            phase = Phase.CALIB_READY
+            return
+        }
+        if (calibSeat == 0) {
+            // J1 recorded: hand over through a visible pause before J2's screen, so the
+            // two voices are never captured in the same breath.
+            calibSeat = 1
+            activeSeat = 1
+            phase = Phase.CALIB_DONE
+            phaseTimer = Tuning.CALIB_PAUSE
+            resetSamples()
+        } else {
+            finishCalibSeat()
+        }
+    }
+
+    private fun finishCalibSeat() {
+        resetSamples()
+        calibOk = false
+        calibAwaitingConfirm = false
+        phase = Phase.ROUND_START
+        phaseTimer = Tuning.ROUND_PAUSE
+    }
+
+    /** Continue after the "À joueur 2" screen: J2 gets his own ready screen and countdown. */
+    fun continueAfterCalibPause() {
+        if (phase != Phase.CALIB_DONE) return
+        resetSamples()
+        calibOk = false
+        calibAwaitingConfirm = false
+        calibCountdownLeft = Tuning.CALIB_COUNTDOWN
+        calibRecordLeft = 0f
+        phase = Phase.CALIB_READY
+    }
+
+    fun startRound() {
+        if (phase != Phase.ROUND_START) return
         score = intArrayOf(0, 0)
         level = 1
         ballsPlayed = 0
         rally = 0
-        serveTo = random.nextInt(2)
+        lastPassDir = 0
         banner = ""
         bannerTimer = 0f
-        phase = Phase.SERVE
+        serveTo = random.nextInt(2)
+        activeSeat = serveTo
         beginServe()
     }
 
@@ -182,12 +303,57 @@ class GameEngine {
         micF0 = voice.f0
         when (phase) {
             Phase.HINTS, Phase.PAUSED -> Unit
-            Phase.CALIBRATION -> {
+            Phase.CALIB_READY -> updatePaddles(dt, voice, liveSeat = calibSeat)
+            Phase.CALIB_COUNTDOWN -> {
+                updatePaddles(dt, voice, liveSeat = calibSeat)
+                calibCountdownLeft -= dt
+                if (calibCountdownLeft <= 0f) {
+                    calibCountdownLeft = 0f
+                    calibRecordLeft = Tuning.CALIB_RECORD
+                    resetSamples()
+                    phase = Phase.CALIB_RECORD
+                }
+            }
+            Phase.CALIB_RECORD -> {
+                if (calibAwaitingConfirm) {
+                    updatePaddles(dt, VoiceFrame())
+                    // stay long enough for the player to read the verdict, then retry
+                    phaseTimer -= dt
+                    if (phaseTimer <= 0f) {
+                        confirmCalibResult()
+                    }
+                    return
+                }
                 collectCalibration(voice)
-                updatePaddles(dt, voice)
+                updatePaddles(dt, voice, liveSeat = calibSeat)
+                calibRecordLeft = max(0f, calibRecordLeft - dt)
+                if (calibRecordLeft <= 0f) {
+                    calibAwaitingConfirm = true
+                    phaseTimer = Tuning.CALIB_RETRY_PAUSE
+                    val enough = calibSamples >= Tuning.CALIB_FALLBACK_SAMPLES
+                    if (enough) {
+                        pads[calibSeat].baseline = median(samples).coerceIn(70f, 420f)
+                        calibOk = true
+                    } else {
+                        calibOk = false
+                    }
+                }
+            }
+            Phase.CALIB_DONE -> {
+                updatePaddles(dt, VoiceFrame())
+                phaseTimer -= dt
+                if (phaseTimer <= 0f) continueAfterCalibPause()
+            }
+            Phase.ROUND_START -> {
+                updatePaddles(dt, VoiceFrame())
+                phaseTimer -= dt
+                if (phaseTimer <= 0f) startRound()
             }
             Phase.SERVE -> {
+                // the flight is already simulated during the serve delay: that is what
+                // keeps activeSeat identical to "the side the ball is flying towards"
                 updatePaddles(dt, voice)
+                updateBall(dt, judgePoint = false)
                 serveTimerLeft -= dt
                 if (serveTimerLeft <= 0f) phase = Phase.PLAY
             }
@@ -198,7 +364,7 @@ class GameEngine {
             Phase.POINT -> {
                 updatePaddles(dt, voice)
                 pointTimer -= dt
-                if (pointTimer <= 0f) beginServe()
+                if (pointTimer <= 0f) pickServe()
             }
         }
         if (bannerTimer > 0f) bannerTimer = max(0f, bannerTimer - dt)
@@ -211,11 +377,8 @@ class GameEngine {
         if (voice.voiced && voice.f0 > 60f && voice.f0 < 500f) {
             samples.add(voice.f0)
             calibSamples = samples.size
-            calibProgress = (samples.size.toFloat() / Tuning.CALIB_TARGET_SAMPLES).coerceIn(0f, 1f)
-            if (samples.size >= Tuning.CALIB_TARGET_SAMPLES) {
-                pads[calibSeat].baseline = median(samples).coerceIn(70f, 420f)
-                nextCalibSeat()
-            }
+            val span = Tuning.CALIB_RECORD * 21f
+            calibProgress = (samples.size / span).coerceIn(0f, 1f)
         }
     }
 
@@ -226,9 +389,9 @@ class GameEngine {
         return if (n % 2 == 1) s[n / 2] else (s[n / 2 - 1] + s[n / 2]) / 2f
     }
 
-    private fun updatePaddles(dt: Float, voice: VoiceFrame) {
+    private fun updatePaddles(dt: Float, voice: VoiceFrame, liveSeat: Int = activeSeat) {
         for (p in pads) {
-            val active = p.seat == activeSeat
+            val active = p.seat == liveSeat
             p.voiced = active && voice.voiced
             if (p.voiced) {
                 p.f0 = voice.f0
@@ -264,7 +427,7 @@ class GameEngine {
         return if (semis > 0f) shaped else -shaped
     }
 
-    private fun updateBall(dt: Float) {
+    private fun updateBall(dt: Float, judgePoint: Boolean = true) {
         val prevX = bx
         bx += bvx * dt
         by += bvy * dt
@@ -283,6 +446,11 @@ class GameEngine {
             hit(seat = 1, faceX = rightFace - ballR, dirX = -1f)
         }
 
+        if (!judgePoint) {
+            // serve delay: clamp only, the point cannot be lost before the serve window ends
+            bx = bx.coerceIn(-ballR * 2.9f, w + ballR * 2.9f)
+            return
+        }
         if (bx < -ballR * 3f) {
             endPoint(scorer = 1)
         } else if (bx > w + ballR * 3f) {
@@ -295,7 +463,7 @@ class GameEngine {
         val contact = abs(by - p.y) <= p.half + ballR
         if (contact && p.charge >= Tuning.CHARGE_TO_BOUNCE) {
             val off = ((by - p.y) / p.half).coerceIn(-1f, 1f)
-            val speed = min(hypot(bvx, bvy) * 1.045f, h * 2.6f)
+            val speed = min(hypot(bvx, bvy) * Tuning.BOUNCE_GAIN, h * Tuning.SPEED_CAP)
             val ang = off * 0.82f
             bx = faceX
             bvx = dirX * speed * cos(ang)
@@ -306,9 +474,11 @@ class GameEngine {
                 bvy = bvy / cur * speed
             }
             rally++
+            lastPassDir = 0
             onBounce?.invoke()
         } else {
             p.passFlash = 1f
+            lastPassDir = dirX.toInt()
             onPass?.invoke()
         }
     }
@@ -324,7 +494,10 @@ class GameEngine {
             if (scorer == 0) "POINT J1" else "POINT J2"
         }
         bannerTimer = 1.5f
-        serveTo = 1 - scorer
+        // Strict alternation: the next ball goes to the side that was NOT just attacked.
+        // Without this, a player who misses twice in a row gets served at forever.
+        val receiver = if (bx < w / 2f) 0 else 1
+        serveTo = 1 - receiver
         activeSeat = serveTo
         bvx = 0f
         bvy = 0f
@@ -333,15 +506,20 @@ class GameEngine {
         onPoint?.invoke()
     }
 
+    /** Serves towards the seat decided by [endPoint]: the two sides strictly alternate. */
+    private fun pickServe() {
+        serveToSide(if (serveTo == 0) -1 else 1)
+    }
+
     private fun beginServe() {
         bx = w / 2f
         by = h / 2f
         activeSeat = serveTo
         val speed = serveSpeed()
-        val ang = (random.nextFloat() - 0.5f) * 0.62f
+        val ang = (random.nextFloat() - 0.5f) * 0.50f
         bvx = if (serveTo == 0) -speed * cos(ang) else speed * cos(ang)
         bvy = speed * sin(ang)
-        serveTimerLeft = 0.9f
+        serveTimerLeft = Tuning.SERVE_DELAY
         phase = Phase.SERVE
     }
 
@@ -349,7 +527,7 @@ class GameEngine {
 
     fun togglePause() {
         phase = when (phase) {
-            Phase.PLAY, Phase.SERVE, Phase.POINT -> {
+            Phase.PLAY, Phase.SERVE, Phase.POINT, Phase.ROUND_START, Phase.CALIB_DONE -> {
                 pausedFrom = phase
                 Phase.PAUSED
             }
@@ -358,5 +536,28 @@ class GameEngine {
         }
     }
 
-    fun isRunning(): Boolean = phase == Phase.PLAY || phase == Phase.SERVE || phase == Phase.POINT
+    /** What to redraw behind the pause overlay. */
+    val resumeStage: Stage
+        get() = when (phase) {
+            Phase.PAUSED -> when (pausedFrom) {
+                Phase.ROUND_START -> Stage.ROUND_START
+                Phase.CALIB_DONE -> Stage.CALIB_DONE
+                else -> if (pausedFrom == Phase.SERVE) Stage.SERVE else Stage.PLAY
+            }
+            Phase.ROUND_START -> Stage.ROUND_START
+            Phase.CALIB_DONE -> Stage.CALIB_DONE
+            Phase.SERVE -> Stage.SERVE
+            Phase.PLAY -> Stage.PLAY
+            Phase.POINT -> Stage.POINT
+            else -> Stage.SERVE
+        }
+
+    /** Restart the current point from the centre, used when coming back from a pause. */
+    fun restartCurrentPoint() {
+        if (phase == Phase.PAUSED) phase = Phase.PLAY
+        beginServe()
+    }
+
+    fun isRunning(): Boolean =
+        phase == Phase.PLAY || phase == Phase.SERVE || phase == Phase.POINT
 }

@@ -17,11 +17,16 @@ Landscape only, one phone flat on the table between two players.
   the ball goes straight through.
 - **Red = you are speaking. Grey = you are silent.**
 - **The ball gets faster every level, a new level every 5 balls played.** There is no
-  end: only the score survives.
-- Before playing, each player hums `mmmm` for two seconds so the game learns their own
-  voice as the zero point.
+  end: only the score survives. Level 1 is deliberately slow (a full crossing takes about
+  3 s on a 16:9 tablet) and each level adds ~5 %.
+- **A ball that goes through is replayed at the same side once.** If the receiver lets it
+  through twice, the direction flips: nobody gets hammered five times in a row.
+- **Calibration is deliberate**: each player in turn gets a ready screen, a 3-2-1 countdown,
+  then 2.5 s of humming. A silent take is rejected and retried. Between the two players
+  there is a hand-over pause, so the two voices are never captured in the same breath.
 
-Seven hint screens explain all of this before the first serve.
+Seven hint screens explain all of this before the first serve, and a rules recap is shown
+just before the first ball.
 
 ## How the voice is turned into movement
 
