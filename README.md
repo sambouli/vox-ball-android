@@ -66,6 +66,13 @@ unknown sources" for the file manager you use. Android 8.0+ (API 26).
 On first launch Android asks for the microphone. Without it the game cannot be played —
 that is the whole point.
 
+## If it crashes
+
+This APK catches its own uncaught exceptions: the last stack trace is written to the
+app's private `crash.txt` and shown on the next launch, on a dark red screen, until you
+tap it away. A screenshot of that screen is a complete bug report — no adb needed.
+The same trace also goes to logcat.
+
 ## Project layout
 
 ```

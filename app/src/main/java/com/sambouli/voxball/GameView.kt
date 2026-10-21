@@ -55,6 +55,9 @@ class GameView @JvmOverloads constructor(
     private var running = false
     private var loopThread: Thread? = null
 
+    @Volatile
+    private var crashReport: String? = null
+
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val tp = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -94,6 +97,22 @@ class GameView @JvmOverloads constructor(
         engine.onPass = { buzz(20, 140) }
         engine.onPoint = { buzz(45, 200) }
         dash = DashPathEffect(floatArrayOf(dp(7f), dp(7f)), 0f)
+        crashReport = readCrashReport()
+    }
+
+    private fun readCrashReport(): String? = try {
+        val f = context.getFileStreamPath(VoxBallApp.CRASH_FILE)
+        if (f.exists()) f.readText().take(2400) else null
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun clearCrashReport() {
+        crashReport = null
+        try {
+            context.getFileStreamPath(VoxBallApp.CRASH_FILE).delete()
+        } catch (_: Throwable) {
+        }
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -118,7 +137,7 @@ class GameView @JvmOverloads constructor(
     }
 
     fun resumeGame() {
-        if (holder.surface.isValid) startLoop()
+        if (holder.surface?.isValid == true) startLoop()
         startVoice()
     }
 
@@ -193,6 +212,10 @@ class GameView @JvmOverloads constructor(
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
         if (e.action != MotionEvent.ACTION_DOWN) return true
+        if (crashReport != null) {
+            clearCrashReport()
+            return true
+        }
         if (!micGranted) {
             onRequestPermission?.invoke()
             return true
@@ -233,6 +256,11 @@ class GameView @JvmOverloads constructor(
 
     private fun drawFrame(c: Canvas, voice: VoiceFrame) {
         drawBackground(c)
+        val crash = crashReport
+        if (crash != null) {
+            drawCrash(c, crash)
+            return
+        }
         when (engine.phase) {
             Phase.HINTS -> {
                 drawHints(c)
@@ -503,6 +531,30 @@ class GameView @JvmOverloads constructor(
         stroke.strokeWidth = dp(2f)
         c.drawRoundRect(quitR, h * 0.02f, h * 0.02f, stroke)
         text(c, Content.QUIT, quitR.centerX(), quitR.centerY() + h * 0.016f, h * 0.040f, Palette.DIM)
+    }
+
+    private fun drawCrash(c: Canvas, report: String) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val scrim = Paint()
+        scrim.color = 0xFF140A0A.toInt()
+        c.drawRect(0f, 0f, w, h, scrim)
+
+        text(c, "DERNIER CRASH", w / 2f, h * 0.11f, h * 0.042f, Palette.RED, bold = true)
+        text(
+            c, "touchez l'écran pour effacer — la trace est aussi dans logcat",
+            w / 2f, h * 0.165f, h * 0.024f, Palette.DIM
+        )
+
+        val size = h * 0.023f
+        var y = h * 0.24f
+        for (line in report.split('\n')) {
+            for (part in wrapText(line, tfReg, size, w * 0.94f)) {
+                if (y > h * 0.96f) return
+                text(c, part, w * 0.03f, y, size, Palette.TEXT, align = Paint.Align.LEFT)
+                y += size * 1.3f
+            }
+        }
     }
 
     private fun drawPermission(c: Canvas) {

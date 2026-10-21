@@ -12,17 +12,17 @@ import android.view.WindowManager
 
 class MainActivity : Activity() {
 
-    private lateinit var gameView: GameView
+    internal lateinit var gameView: GameView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        goImmersive()
 
         gameView = GameView(this)
         gameView.onRequestPermission = { askMic() }
         gameView.onExit = { finish() }
         setContentView(gameView)
+        goImmersive()
 
         if (hasMic()) {
             gameView.setMicGranted(true)
@@ -67,6 +67,9 @@ class MainActivity : Activity() {
     }
 
     private fun goImmersive() {
+        // Touching the insets controller before the DecorView exists throws
+        // NullPointerException inside Window (mDecor == null), so force it first.
+        val decor = window.decorView
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.setDecorFitsSystemWindows(false)
             window.insetsController?.let {
@@ -75,7 +78,7 @@ class MainActivity : Activity() {
             }
         } else {
             @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = (
+            decor.systemUiVisibility = (
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                     or View.SYSTEM_UI_FLAG_FULLSCREEN
                     or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
