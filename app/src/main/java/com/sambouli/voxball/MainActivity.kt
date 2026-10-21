@@ -2,6 +2,7 @@ package com.sambouli.voxball
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -13,6 +14,9 @@ import android.view.WindowManager
 class MainActivity : Activity() {
 
     internal lateinit var gameView: GameView
+
+    /** False until we already resumed once; a silent cold start must not auto-pause the game. */
+    private var restoredOnce = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,6 +58,13 @@ class MainActivity : Activity() {
         super.onResume()
         goImmersive()
         gameView.resumeGame()
+        // COMING BACK from the app switcher: the game was still running in memory while
+        // the microphone was dead, so the ball may have moved for nobody. Freeze it
+        // instead of losing a point in the dark.
+        if (restoredOnce) {
+            gameView.autoPauseIfRunning()
+        }
+        restoredOnce = true
     }
 
     override fun onPause() {

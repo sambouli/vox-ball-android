@@ -8,17 +8,149 @@ import kotlin.random.Random
 
 class GameEngineTest {
 
+    /** A voiced frame at 200 Hz: what the analyser reports during a hummed note. */
+    private fun hum() = VoiceFrame(voiced = true, f0 = 200f, level = 0.8f, clarity = 0.9f)
+
+    /** Walks a player through the full ready -> countdown -> recorded -> confirm sequence. */
+    private fun calibrate(e: GameEngine) {
+        var guard = 0
+        while (e.phase == Phase.CALIB_DONE && guard++ < 400) e.update(0.05f, VoiceFrame())
+        e.beginCalibCountdown()
+        while (e.phase == Phase.CALIB_COUNTDOWN && guard++ < 400) e.update(0.05f, VoiceFrame())
+        while (!e.calibAwaitingConfirm && guard++ < 400) e.update(0.05f, hum())
+        e.confirmCalibResult()
+    }
+
     private fun playingEngine(seed: Int = 7): GameEngine {
         val e = GameEngine()
         e.random = Random(seed)
         e.resize(1600f, 900f)
         var guard = 0
         while (e.phase == Phase.HINTS && guard++ < 40) e.advanceHint()
-        e.skipCalibSeat()
-        e.skipCalibSeat()
+        calibrate(e) // J1
+        e.continueAfterCalibPause()
+        calibrate(e) // J2
+        e.startRound()
         guard = 0
         while (e.phase == Phase.SERVE && guard++ < 100) e.update(0.05f, VoiceFrame())
         return e
+    }
+
+    @Test
+    fun calibrationWaitsForThePlayerAndCountsDown() {
+        val e = GameEngine()
+        e.resize(1600f, 900f)
+        while (e.phase == Phase.HINTS) e.advanceHint()
+        assertEquals(Phase.CALIB_READY, e.phase)
+        assertEquals(0, e.calibSeat)
+        // nothing is captured until the player is ready: a voice in the room is ignored
+        repeat(40) { e.update(0.05f, hum()) }
+        assertEquals(0, e.calibSamples)
+        assertEquals(Phase.CALIB_READY, e.phase)
+
+        e.beginCalibCountdown()
+        assertEquals(Phase.CALIB_COUNTDOWN, e.phase)
+        repeat(20) { e.update(0.05f, hum()) } // 1 s of countdown: still ignored
+        assertEquals(0, e.calibSamples)
+
+        var guard = 0
+        while (e.phase == Phase.CALIB_COUNTDOWN && guard++ < 200) e.update(0.05f, VoiceFrame())
+        assertEquals(Phase.CALIB_RECORD, e.phase)
+    }
+
+    @Test
+    fun aSilentRecordingIsRejectedAndRetried() {
+        val e = GameEngine()
+        e.resize(1600f, 900f)
+        while (e.phase == Phase.HINTS) e.advanceHint()
+        e.beginCalibCountdown()
+        var guard = 0
+        while (e.phase != Phase.CALIB_RECORD && guard++ < 200) e.update(0.05f, VoiceFrame())
+        while (!e.calibAwaitingConfirm && guard++ < 200) e.update(0.05f, VoiceFrame())
+        assertTrue(e.calibAwaitingConfirm)
+        assertTrue("nothing heard must not be accepted", !e.calibOk)
+        assertEquals("a silent take does not hand over", 0, e.calibSeat)
+        assertTrue(
+            "back on the ready screen for the same player",
+            e.phase == Phase.CALIB_READY || e.phase == Phase.CALIB_RECORD
+        )
+        assertEquals("the take buffer is empty again", 0, e.calibSamples)
+    }
+
+    @Test
+    fun calibrationHandsOverToAPauseScreenInsteadOfChaining() {
+        val e = GameEngine()
+        e.resize(1600f, 900f)
+        while (e.phase == Phase.HINTS) e.advanceHint()
+        calibrate(e) // J1 hums 200 Hz
+        assertEquals("hand over to a visible pause", Phase.CALIB_DONE, e.phase)
+        assertEquals(1, e.calibSeat)
+        assertEquals("J1 keeps his own baseline", 200f, e.pads[0].baseline, 6f)
+        assertTrue("J2 has not been measured yet", e.pads[1].baseline < 1f)
+
+        // during the hand-over pause nothing can be captured, whoever speaks
+        repeat(20) { e.update(0.05f, VoiceFrame(voiced = true, f0 = 300f, level = 0.9f, clarity = 0.9f)) }
+        assertEquals(Phase.CALIB_DONE, e.phase)
+        assertEquals(0, e.calibSamples)
+
+        // after the pause J2 gets his own ready screen; the recording only starts on purpose
+        var guard = 0
+        while (e.phase == Phase.CALIB_DONE && guard++ < 200) e.update(0.05f, VoiceFrame())
+        assertEquals(Phase.CALIB_READY, e.phase)
+        assertEquals(1, e.calibSeat)
+        repeat(20) { e.update(0.05f, VoiceFrame(voiced = true, f0 = 300f, level = 0.9f, clarity = 0.9f)) }
+        assertEquals("still nothing captured before J2 taps", 0, e.calibSamples)
+    }
+
+    @Test
+    fun theFirstLevelIsGentle() {
+        val e = playingEngine()
+        // a full-length court crossing must take over two seconds at level 1
+        val crossingSeconds = e.w / e.serveSpeed()
+        assertTrue("level 1 crossing took $crossingSeconds s", crossingSeconds > 2.0f)
+        val slow = e.serveSpeed()
+        repeat(10) { forcePoint(e, 0) }
+        assertTrue("still accelerates with levels", e.serveSpeed() > slow)
+    }
+
+    @Test
+    fun aBallThatGoesThroughIsReplayedAtTheSameSideOnlyOnce() {
+        val e = playingEngine()
+        val startScore = e.score[0] + e.score[1]
+        val passed = ArrayList<Int>()
+        e.onPass = { passed.add(if (e.bx < 800f) 0 else 1) }
+        // Let the ball pass the receiver each time, never filling a racket.
+        var guard = 0
+        while (passed.size < 2 && guard++ < 4000) {
+            e.pads[0].charge = 0f
+            e.pads[1].charge = 0f
+            e.update(1f / 60f, VoiceFrame())
+        }
+        assertEquals("two balls were let through", 2, passed.size)
+        // the pass is seen at the racket, the point lands when the ball leaves the court
+        guard = 0
+        while (e.phase == Phase.PLAY && guard++ < 600) e.update(1f / 60f, VoiceFrame())
+        assertEquals("both points went to the other player", startScore + 2, e.score[0] + e.score[1])
+        assertNotEquals(
+            "the serve must alternate away from the loser (passed seats: $passed)",
+            passed[0], passed[1]
+        )
+    }
+
+    @Test
+    fun receiverIsAlwaysLiveWhileTheBallComesAtHim() {
+        val e = playingEngine()
+        var guard = 0
+        // whatever the flight, the seat with the microphone is the one being aimed at
+        repeat(30) {
+            while (!e.isRunning() && guard++ < 200) e.update(0.05f, VoiceFrame())
+            if (e.isRunning()) {
+                if (e.bvx < 0f) assertEquals(0, e.activeSeat) else assertEquals(1, e.activeSeat)
+            }
+            e.pads[0].charge = 0f
+            e.pads[1].charge = 0f
+            e.update(1f / 60f, VoiceFrame())
+        }
     }
 
     private fun forcePoint(e: GameEngine, scorer: Int) {
@@ -162,14 +294,15 @@ class GameEngineTest {
     }
 
     @Test
-    fun serveGoesToThePlayerWhoJustLostThePoint() {
+    fun serveAlternatesToTheOtherPlayer() {
         val e = playingEngine()
-        forcePoint(e, 0) // J1 scores, J2 lost
-        assertEquals(1, e.serveTo)
+        // J1 scores: the ball was lost on J2's side, so the next ball must go to J1
+        val before = e.serveTo
+        forcePoint(e, 0)
+        assertNotEquals("never the same receiver twice", before, e.serveTo)
         var guard = 0
         while (e.phase != Phase.SERVE && guard++ < 200) e.update(0.05f, VoiceFrame())
-        assertEquals(1, e.serveTo)
-        assertEquals("the receiver owns the voice", 1, e.activeSeat)
+        assertEquals("the ball flies towards the announced seat", e.serveTo, e.activeSeat)
         assertNotEquals(0f, e.bvx)
     }
 

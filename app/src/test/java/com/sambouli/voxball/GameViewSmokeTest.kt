@@ -5,7 +5,8 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import org.junit.After
-import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
@@ -101,9 +102,37 @@ class GameViewSmokeTest {
             draw(view)
             tap(view)
         }
-        assertNotNull(engine.phase)
+        draw(view) // ready
+        engine.beginCalibCountdown()
+        draw(view) // countdown
+        engine.update(0.05f, VoiceFrame())
+        while (engine.phase == Phase.CALIB_COUNTDOWN) engine.update(0.05f, VoiceFrame())
+        draw(view, VoiceFrame(voiced = true, f0 = 220f, level = 0.9f, clarity = 0.95f)) // recording
+    }
+
+    @Test
+    fun drawsTheHandOverAndRoundStartScreens() {
+        val view = launch(1920, 1200)
+        view.setMicGranted(true)
+        val engine = engineOf(view)
+        while (engine.phase == Phase.HINTS) engine.advanceHint()
+        engine.beginCalibCountdown()
+        while (engine.phase != Phase.CALIB_RECORD) engine.update(0.05f, VoiceFrame())
+        while (!engine.calibAwaitingConfirm) {
+            engine.update(0.05f, VoiceFrame(voiced = true, f0 = 150f, level = 0.8f, clarity = 0.9f))
+        }
+        draw(view) // "voix enregistrée"
+        engine.confirmCalibResult()
+        assertEquals(Phase.CALIB_DONE, engine.phase)
+        draw(view) // "À joueur 2"
+        tap(view)
+        assertEquals(Phase.CALIB_READY, engine.phase)
+        engine.skipCalibSeat()
+        assertEquals(Phase.ROUND_START, engine.phase)
+        draw(view) // rules recap
+        tap(view)
+        assertTrue(engine.phase == Phase.SERVE || engine.phase == Phase.PLAY)
         draw(view)
-        draw(view, VoiceFrame(voiced = true, f0 = 220f, level = 0.9f, clarity = 0.95f))
     }
 
     @Test
@@ -111,8 +140,12 @@ class GameViewSmokeTest {
         val view = launch(2560, 1600) // tablet geometry
         view.setMicGranted(true)
         val engine = engineOf(view)
+        while (engine.phase == Phase.HINTS) engine.advanceHint()
+        engine.beginCalibCountdown()
+        while (engine.phase != Phase.CALIB_RECORD) engine.update(0.05f, VoiceFrame())
         engine.skipCalibSeat()
-        engine.skipCalibSeat()
+        engine.startRound()
+        draw(view) // rules recap
         draw(view) // serve
         engine.update(0.05f, VoiceFrame())
         engine.update(0.05f, VoiceFrame(voiced = true, f0 = 250f, level = 0.9f, clarity = 0.9f))
@@ -128,14 +161,14 @@ class GameViewSmokeTest {
             val view = launch(w, h)
             view.setMicGranted(true)
             val engine = engineOf(view)
+            while (engine.phase == Phase.HINTS) engine.advanceHint()
+            engine.beginCalibCountdown()
+            while (engine.phase != Phase.CALIB_RECORD) engine.update(0.05f, VoiceFrame())
             engine.skipCalibSeat()
-            engine.skipCalibSeat()
+            engine.startRound()
             repeat(400) {
                 engine.update(1f / 60f, if (it % 3 == 0) VoiceFrame(voiced = true, f0 = 210f, level = 0.8f, clarity = 0.9f) else VoiceFrame())
-                if (engine.phase == Phase.CALIBRATION) {
-                    engine.skipCalibSeat()
-                    engine.skipCalibSeat()
-                }
+                if (!engine.isRunning() && engine.phase != Phase.PAUSED) engine.startRound()
                 draw(view)
             }
             activity?.gameView?.pauseGame()

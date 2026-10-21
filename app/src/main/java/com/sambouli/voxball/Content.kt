@@ -43,8 +43,9 @@ object Content {
         ),
         Hint(
             "7 / 7",
-            "Avant de jouer, chacun fredonne « mmmm » pendant deux secondes.\n\n" +
-                "Le jeu apprend votre hauteur de voix : c'est votre point zéro."
+            "Le jeu ralentit volontairement le premier niveau.\n\n" +
+                "Avant le départ, chacun fredonne « mmmm » pendant deux secondes :\n" +
+                "c'est votre point zéro de voix."
         )
     )
 
